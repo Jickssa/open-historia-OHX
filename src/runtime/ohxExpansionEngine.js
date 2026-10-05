@@ -238,3 +238,66 @@ export const deriveCommitments = ({ world }) => array(world?.agreements)
     type: clean(a?.type) || "other",
     status: lower(a?.status) || "active",
     parties: unique(a?.parties).slice(0, 8),
+    terms: clean(a?.terms).slice(0, 340),
+  }));
+
+const scoreCandidate = (event, index, count) => {
+  const category = categoryOf(event);
+  const scores = categoryScores(event);
+  const breadth = Object.values(scores).filter((value) => value > 0).length;
+  const consequenceCount = event?.impacts && typeof event.impacts === "object" && !Array.isArray(event.impacts)
+    ? Object.keys(event.impacts).length
+    : 0;
+  const recency = index / Math.max(1, count - 1);
+  return importanceOf(event) * 20 + (event.notable ? 12 : 0) + breadth * 5 + consequenceCount * 3 + recency * 4 + (category === "regulation" ? 2 : 0);
+};
+
+export const buildInteractiveDeck = ({ world, events, round }) => {
+  const recent = pickRecentEvents({ world, events });
+  const scored = recent.filter(isCandidateEvent).map((event, index, all) => {
+    const eventId = clean(event.id);
+    const officialPlayable = clean(world?.interactiveOffer?.eventId) === eventId;
+    return {
+      eventId,
+      title: clean(event.title),
+      date: clean(event.date),
+      category: categoryOf(event),
+      score: scoreCandidate(event, index, all.length),
+      reason: REASONS[categoryOf(event)] || REASONS.general,
+      officialPlayable,
+      status: officialPlayable ? "offered" : "candidate",
+    };
+  });
+  scored.sort((a, b) => b.score - a.score || a.title.localeCompare(b.title));
+  return { round: finite(round, 1), offers: scored.slice(0, 8) };
+};
+
+const sameJson = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+export const buildExpansionState = ({ world = {}, events = [], game = {}, previous = {} }) => {
+  const round = finite(game?.round, 1);
+  const dynamics = deriveDynamics({ world, events });
+  const deck = buildInteractiveDeck({ world, events, round });
+  const currentHistory = array(previous?.metricsHistory);
+  const historyRecord = { round, date: clean(game?.gameDate), ...dynamics };
+  const metricsHistory = currentHistory.length && currentHistory.at(-1)?.round === round && currentHistory.at(-1)?.date === historyRecord.date
+    ? currentHistory
+    : [...currentHistory, historyRecord].slice(-24);
+  return {
+    version: 3,
+    round,
+    gameDate: clean(game?.gameDate),
+    metrics: dynamics,
+    crises: deriveCrises({ world, events, dynamics }),
+    actors: deriveActors({ world, dynamics, playerName: game?.country || "" }),
+    commitments: deriveCommitments({ world }),
+    storylines: deriveStorylines({ world }),
+    interactiveDeck: deck,
+    playedMomentIds: unique(previous?.playedMomentIds).slice(-280),
+    metricsHistory,
+    source: "derived-in-memory",
+    updatedByRound: round,
+  };
+};
+
+export const equivalentExpansionState = (a, b) => sameJson(a, b);
