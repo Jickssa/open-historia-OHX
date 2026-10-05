@@ -16,9 +16,9 @@ check("OHX runtime never imports writeWorldState", !/writeWorldState/.test(runti
 check("OHX runtime never fabricates interactiveOffer", !/interactiveOffer\\s*:/.test(runtime));
 check("OHX runtime gates playback on native interactiveOffer", /latestWorld\\?\\.interactiveOffer\\?\\.eventId/.test(runtime));
 check("OHX runtime listens for canonical world/game events", /oh:world-updated/.test(runtime) && /oh:game-updated/.test(runtime));
-check("OHX runtime ignores chat writes", /key === \"chat\"\\) return/.test(runtime));
-check("OHX runtime cleans all installed listeners", /removeEventListener\\(\"oh:world-updated\"/.test(runtime) && /removeEventListener\\(\"oh:active-game-changed\"/.test(runtime));
-check("OHX boot is deferred by 1200 ms", /window\\.setTimeout\\(\\(\\) => bootOHXExpansion\\(\\), 1200\\)/.test(main));
+check("OHX runtime ignores chat writes", /key === "chat"\) return/.test(runtime));
+check("OHX runtime cleans all installed listeners", /removeEventListener\("oh:world-updated"/.test(runtime) && /removeEventListener\("oh:active-game-changed"/.test(runtime));
+check("OHX boot is deferred by 1200 ms", /window\.setTimeout\(\(\) => bootOHXExpansion\(\), 1200\)/.test(main));
 check("OHX UI has no extreme legacy z-index", !/2147483/.test(ui));
 check("OHX UI surfaces runtime errors accessibly", /role: \"alert\"/.test(ui));
 check("OHX engine is non-persistent", !/localStorage|writeWorldState|fetch\\(/.test(engine));
