@@ -1,6 +1,7 @@
 import { createRoot } from "react-dom/client";
 import { installAppHeight } from "./runtime/mobileUi.js";
 import { installNativeBackgroundPause } from "./runtime/native/backgroundPause.js";
+import { bootOHXExpansion } from "./runtime/ohxExpansion.js";
 import { reportRendererRestart } from "./runtime/native/rendererRestart.js";
 import { isGenerating } from "./Game/AI/simulationStatus.js";
 import { startTranslator } from "./runtime/translator.js";
@@ -44,6 +45,7 @@ const mount = () => {
     // Live-translates the UI when a non-English language is set in Settings.
     startTranslator();
     registerServiceWorker();
+    window.setTimeout(() => bootOHXExpansion(), 1200);
     // The Android app rests in the background once nothing is being generated
     // (runtime/native/backgroundPause.js).
     if (import.meta.env.VITE_OH_NATIVE) installNativeBackgroundPause(isGenerating);

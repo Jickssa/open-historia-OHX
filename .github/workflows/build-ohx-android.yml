@@ -1,83 +1,104 @@
-name: Build Open Historia OHX
+name: Build Open Historia OHX — Production Fix
 
 on:
+  push:
+    branches:
+      - ohx/3.0.1-final-debug
+    paths:
+      - "src/**"
+      - "mobile/**"
+      - "scripts/ohx/**"
+      - ".github/workflows/build-ohx-android.yml"
+      - "package.json"
+      - "package-lock.json"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "mobile/**"
+      - "scripts/ohx/**"
+      - ".github/workflows/build-ohx-android.yml"
+      - "package.json"
+      - "package-lock.json"
   workflow_dispatch:
+    inputs:
+      build_variant:
+        description: "Android build variant"
+        required: false
+        default: "debug"
+        type: choice
+        options:
+          - debug
+          - release
 
 permissions:
   contents: read
 
 jobs:
-  build:
+  verify-and-build:
     runs-on: ubuntu-latest
-    env:
-      BASE_SHA: 0eec087ce7bad0ec39937c33743a147d82477d94
-      UPSTREAM_REPO: Open-Historia/open-historia
     steps:
-      - name: Checkout fork workspace (contains OHX kit)
+      - name: Checkout current OHX branch
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
 
-      - name: Refuse stale upstream base
-        shell: bash
-        run: |
-          set -euo pipefail
-          current="$(git ls-remote "https://github.com/${UPSTREAM_REPO}.git" refs/heads/main | awk '{print $1}')"
-          test -n "$current"
-          echo "Pinned base: $BASE_SHA"
-          echo "Upstream main: $current"
-          if [ "$current" != "$BASE_SHA" ]; then
-            echo "::error::Upstream main moved. This reproducible OHX kit must be regenerated/rebased before building."
-            exit 1
-          fi
-
-      - name: Fetch exact Open Historia reference archive
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf build-src /tmp/open-historia-ohx.tar.gz
-          mkdir -p build-src
-          curl -L --fail --retry 3 --retry-delay 2 \
-            -o /tmp/open-historia-ohx.tar.gz \
-            "https://github.com/${UPSTREAM_REPO}/archive/${BASE_SHA}.tar.gz"
-          tar -xzf /tmp/open-historia-ohx.tar.gz --strip-components=1 -C build-src
-          test -f build-src/package.json
-          test -f .ohx/ohx_expansion.patch
-
-      - name: Verify and apply OHX patch to reference source
-        shell: bash
-        run: |
-          set -euo pipefail
-          cp .ohx/ohx_expansion.patch build-src/.ohx_expansion.patch
-          cd build-src
-          git init -q
-          git add -A
-          git -c user.name=OHX -c user.email=ohx@example.invalid commit -qm "Reference base"
-          git apply --check .ohx_expansion.patch
-          git apply .ohx_expansion.patch
-          test -f src/runtime/ohxExpansion.js
-          test -f src/runtime/ohxExpansionEngine.js
-          test -f src/runtime/ohxExpansionUI.js
-
-      - name: Setup Node
+      - name: Setup Node 24
         uses: actions/setup-node@v5
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: build-src/package-lock.json
+          cache-dependency-path: package-lock.json
 
-      - name: Setup Java
+      - name: Setup Java 21
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
 
-      - name: Verify source
-        working-directory: build-src
+      - name: Install dependencies and run full regression suite
         run: |
+          set -euo pipefail
           npm ci
           npm test
 
-      - name: Make OHX a separate Android app
-        working-directory: build-src
+      - name: Full repository lint baseline (informational)
+        shell: bash
+        run: |
+          set +e
+          npm run lint 2>&1 | tee /tmp/open-historia-full-lint.log
+          code=${PIPESTATUS[0]}
+          if [ "$code" -ne 0 ]; then
+            echo "::warning::Full repository lint still reports upstream baseline violations; the OHX gate below remains strict."
+          fi
+          exit 0
+
+      - name: Strict lint for OHX integration
+        run: >
+          npx eslint
+          src/main.jsx
+          src/runtime/ohxExpansion.js
+          src/runtime/ohxExpansionEngine.js
+          src/runtime/ohxExpansionUI.js
+          src/runtime/ohxExpansion.test.js
+          src/runtime/ohxExpansionEngine.test.js
+          scripts/ohx/static-ohx-audit.mjs
+          scripts/ohx/core-chat-audit.mjs
+
+      - name: Static OHX race-safety audit
+        run: node scripts/ohx/static-ohx-audit.mjs
+
+      - name: Audit native Diplomacy / Conseiller paths
+        run: node scripts/ohx/core-chat-audit.mjs
+
+      - name: Build Android web bundle
+        env:
+          VITE_APP_BUILD: ${{ github.run_number }}
+          VITE_APP_TRACK: ohx
+        run: npm run build:android
+
+      - name: Make OHX a separate Android application
         shell: bash
         run: |
           set -euo pipefail
@@ -89,7 +110,7 @@ jobs:
           old = 'io.github.arkniem.paxhistoria"'
           new = 'io.github.arkniem.paxhistoria.ohx"'
           if old not in s:
-              raise SystemExit('stable Capacitor app id not found')
+              raise SystemExit('stable Capacitor application id not found')
           p.write_text(s.replace(old, new))
 
           p = Path('mobile/android/app/build.gradle')
@@ -105,55 +126,58 @@ jobs:
               raise SystemExit('Android label expression not found')
           p.write_text(s.replace(old, new))
           PY
-          grep -q 'io.github.arkniem.paxhistoria.ohx"' mobile/capacitor.config.json
-          grep -q 'io.github.arkniem.paxhistoria.ohx"' mobile/android/app/build.gradle
-
-      - name: Build Android web bundle
-        working-directory: build-src
-        env:
-          VITE_APP_BUILD: ${{ github.run_number }}
-          # `ohx` is intentionally NOT registered in the official update feed.
-          # That makes the APK's update check return an empty manifest instead of
-          # advertising an incompatible stable/beta APK.
-          VITE_APP_TRACK: ohx
-        run: npm run build:android
 
       - name: Restore map-data cache
         uses: actions/cache@v4
         with:
-          path: build-src/mobile/map-cache
-          key: ohx-map-data-${{ hashFiles('build-src/mobile/map-assets.android.json') }}
+          path: mobile/map-cache
+          key: ohx-map-data-${{ hashFiles('mobile/map-assets.android.json') }}
 
-      - name: Build installable debug APK
-        working-directory: build-src/mobile
+      - name: Build Android web assets
+        working-directory: mobile
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run map
+          npm run www
+          npx cap sync android
+
+      - name: Assemble Android APK
+        working-directory: mobile/android
         env:
           OH_ANDROID_BUILD: ${{ github.run_number }}
           VITE_APP_BUILD: ${{ github.run_number }}
           VITE_APP_TRACK: ohx
         run: |
-          npm ci
-          npm run map
-          npm run www
-          npx cap sync android
-          cd android
+          set -euo pipefail
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon
+          if [[ "${{ inputs.build_variant || 'debug' }}" == "release" ]]; then
+            ./gradlew assembleRelease --no-daemon
+          else
+            ./gradlew assembleDebug --no-daemon
+          fi
 
-      - name: Publish APK into artifact staging path
+      - name: Stage and verify APK
         shell: bash
         run: |
           set -euo pipefail
-          apk="build-src/mobile/android/app/build/outputs/apk/debug/app-debug.apk"
+          mkdir -p dist/ohx-apk
+          if [[ "${{ inputs.build_variant || 'debug' }}" == "release" ]]; then
+            apk="mobile/android/app/build/outputs/apk/release/app-release.apk"
+          else
+            apk="mobile/android/app/build/outputs/apk/debug/app-debug.apk"
+          fi
           test -f "$apk"
-          cp "$apk" open-historia-ohx.apk
-          ls -lh open-historia-ohx.apk
-          sha256sum open-historia-ohx.apk | tee open-historia-ohx.apk.sha256
+          test "$(stat -c '%s' "$apk")" -gt 10000000
+          cp "$apk" dist/ohx-apk/open-historia-ohx.apk
+          (cd dist/ohx-apk && sha256sum open-historia-ohx.apk | tee open-historia-ohx.apk.sha256)
+          unzip -t dist/ohx-apk/open-historia-ohx.apk >/tmp/ohx-apk-unzip-test.txt
+          cat /tmp/ohx-apk-unzip-test.txt
+          ls -lh dist/ohx-apk
 
-      - name: Upload APK
+      - name: Upload verified APK
         uses: actions/upload-artifact@v6
         with:
           name: open-historia-ohx
-          path: |
-            open-historia-ohx.apk
-            open-historia-ohx.apk.sha256
+          path: dist/ohx-apk/*
           retention-days: 14
