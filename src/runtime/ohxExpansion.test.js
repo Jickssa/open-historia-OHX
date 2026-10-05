@@ -16,7 +16,7 @@ test("OHX runtime is non-destructive and cannot import the canonical world write
 });
 
 test("OHX runtime isolates chat persistence and cleans up its listeners", () => {
-  assert.match(runtimeSource, /key === \"chat\"\) return/);
+  assert.match(runtimeSource, /key === "chat"\) return/);
   assert.match(runtimeSource, /oh:runtime-json-updated/);
   assert.match(runtimeSource, /oh:active-game-changed/);
   assert.match(runtimeSource, /removeEventListener\("oh:runtime-json-updated"/);
