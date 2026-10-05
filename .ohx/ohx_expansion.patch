@@ -1,0 +1,569 @@
+diff --git a/src/main.jsx b/src/main.jsx
+index 73519e3..745bc7d 100644
+--- a/src/main.jsx
++++ b/src/main.jsx
+@@ -1,6 +1,7 @@
+ import { createRoot } from "react-dom/client";
+ import { installAppHeight } from "./runtime/mobileUi.js";
+ import { installNativeBackgroundPause } from "./runtime/native/backgroundPause.js";
++import { bootOHXExpansion } from "./runtime/ohxExpansion.js";
+ import { reportRendererRestart } from "./runtime/native/rendererRestart.js";
+ import { isGenerating } from "./Game/AI/simulationStatus.js";
+ import { startTranslator } from "./runtime/translator.js";
+@@ -44,6 +45,7 @@ const mount = () => {
+     // Live-translates the UI when a non-English language is set in Settings.
+     startTranslator();
+     registerServiceWorker();
++    bootOHXExpansion();
+     // The Android app rests in the background once nothing is being generated
+     // (runtime/native/backgroundPause.js).
+     if (import.meta.env.VITE_OH_NATIVE) installNativeBackgroundPause(isGenerating);
+diff --git a/src/runtime/ohxExpansion.js b/src/runtime/ohxExpansion.js
+new file mode 100644
+index 0000000..ccc2a9a
+--- /dev/null
++++ b/src/runtime/ohxExpansion.js
+@@ -0,0 +1,103 @@
++/*! Open Historia Expansion Layer — boot, persistence and interactive deck. */
++
++import { readEventsState, readGameData, readWorldState, writeWorldState } from "./gameState.js";
++import { OHXSituationRoom } from "./ohxExpansionUI.js";
++import { buildExpansionState } from "./ohxExpansionEngine.js";
++
++let booted = false;
++let busy = false;
++let pendingTimer = null;
++let currentState = {};
++let situationRoom = null;
++
++const text = (value) => String(value ?? "").trim();
++const arr = (value) => Array.isArray(value) ? value : [];
++const stableComparable = (state) => ({
++  version: state?.version || 1,
++  round: Number(state?.round || 0),
++  gameDate: text(state?.gameDate),
++  metrics: state?.metrics || {},
++  crises: arr(state?.crises),
++  actors: arr(state?.actors),
++  commitments: arr(state?.commitments),
++  storylines: arr(state?.storylines),
++  interactiveDeck: {
++    round: Number(state?.interactiveDeck?.round || 0),
++    offers: arr(state?.interactiveDeck?.offers),
++  },
++  playedMomentIds: arr(state?.playedMomentIds).map(text).filter(Boolean),
++  metricsHistory: arr(state?.metricsHistory),
++});
++
++const sameStable = (a, b) => JSON.stringify(stableComparable(a)) === JSON.stringify(stableComparable(b));
++
++const refreshExpansion = async () => {
++  if (busy) return;
++  busy = true;
++  try {
++    const [world, events, game] = await Promise.all([
++      readWorldState({ force: true }),
++      readEventsState({ force: true }),
++      readGameData({ force: true }),
++    ]);
++    const base = world?.ohx && typeof world.ohx === "object" ? world.ohx : {};
++    const next = buildExpansionState({ world, events, game });
++    next.playedMomentIds = arr(base.playedMomentIds).map(text).filter(Boolean).slice(-280);
++    currentState = next;
++
++    if (!sameStable({ ...base, interactiveDeck: undefined, lastUpdatedAt: undefined }, { ...next, interactiveDeck: undefined, lastUpdatedAt: undefined })
++      || JSON.stringify(base.interactiveDeck) !== JSON.stringify(next.interactiveDeck)) {
++      await writeWorldState({ ...world, ohx: next });
++    }
++    situationRoom?.setState();
++  } catch (error) {
++    console.warn("[OHX] Expansion refresh failed:", error);
++  } finally {
++    busy = false;
++  }
++};
++
++const scheduleRefresh = () => {
++  if (pendingTimer) clearTimeout(pendingTimer);
++  pendingTimer = setTimeout(() => {
++    pendingTimer = null;
++    void refreshExpansion();
++  }, 260);
++};
++
++const playMoment = async (eventId) => {
++  const id = text(eventId);
++  if (!id) return;
++  const world = await readWorldState({ force: true });
++  const round = Number(currentState?.round || 0);
++  const offers = arr(world?.ohx?.interactiveDeck?.offers);
++  if (!offers.some((offer) => text(offer?.eventId) === id)) throw new Error("Moment indisponible.");
++  const played = arr(world?.ohx?.playedMomentIds).map(text).filter(Boolean);
++  if (!played.includes(id)) played.push(id);
++  await writeWorldState({
++    ...world,
++    ohx: { ...(world.ohx || {}), playedMomentIds: played.slice(-280) },
++    interactiveOffer: { eventId: id, round },
++  });
++
++  try {
++    const { createInteractive } = await import("../Game/AI/gameplayLazy.js");
++    await createInteractive({ eventId: id });
++    window.dispatchEvent(new Event("oh:open-interactive-event"));
++  } catch (error) {
++    const rollback = await readWorldState({ force: true });
++    await writeWorldState({ ...rollback, interactiveOffer: null, ohx: { ...(rollback.ohx || {}), playedMomentIds: arr(rollback?.ohx?.playedMomentIds).filter((value) => text(value) !== id) } });
++    throw error;
++  } finally {
++    scheduleRefresh();
++  }
++};
++
++export const bootOHXExpansion = () => {
++  if (booted || typeof window === "undefined" || typeof document === "undefined") return;
++  booted = true;
++  situationRoom = new OHXSituationRoom({ getState: () => currentState, onPlayMoment: playMoment });
++  window.addEventListener("oh:world-updated", scheduleRefresh);
++  window.addEventListener("oh:game-updated", scheduleRefresh);
++  void refreshExpansion();
++};
+diff --git a/src/runtime/ohxExpansionEngine.js b/src/runtime/ohxExpansionEngine.js
+new file mode 100644
+index 0000000..a77ffd8
+--- /dev/null
++++ b/src/runtime/ohxExpansionEngine.js
+@@ -0,0 +1,258 @@
++/*! Open Historia Expansion Layer — deterministic immersion systems, 2026. */
++
++const clean = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
++const array = (value) => (Array.isArray(value) ? value : []);
++const finite = (value, fallback = 0) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
++const clamp = (value, min = 0, max = 100) => Math.max(min, Math.min(max, finite(value, min)));
++const lower = (value) => clean(value).toLowerCase();
++
++const IMPORTANCE = { critical: 5, high: 4, major: 3, moderate: 2, minor: 1 };
++
++const KEYWORDS = Object.freeze({
++  market: ["market", "commerce", "trade", "finance", "bank", "currency", "sanction", "tariff", "prix", "marché", "commerce", "finance", "banque", "devise", "sanction", "douane"],
++  health: ["health", "hospital", "medicine", "medical", "public health", "healthcare", "santé", "hôpital", "médicament", "médical", "soins", "pharma", "overdose"],
++  logistics: ["port", "shipping", "supply", "logistics", "warehouse", "transport", "cargo", "container", "chaîne", "approvisionnement", "logistique", "entrepôt", "transport", "fret"],
++  diplomacy: ["summit", "treaty", "agreement", "negotiation", "ambassador", "diplomatic", "sanction", "sommet", "traité", "accord", "négociation", "ambassadeur", "diplomatique"],
++  security: ["security", "police", "customs", "intelligence", "spy", "arrest", "investigation", "sécurité", "police", "douane", "renseignement", "espion", "enquête", "arrestation"],
++  society: ["protest", "election", "public opinion", "media", "demonstration", "protestation", "opinion publique", "média", "manifestation", "grève", "strike"],
++  technology: ["digital", "cyber", "software", "platform", "algorithm", "AI", "numérique", "cyber", "plateforme", "algorithme", "technologie"],
++});
++
++const countKeywordHits = (text, words) => {
++  const hay = lower(text);
++  return words.reduce((sum, word) => sum + (hay.includes(lower(word)) ? 1 : 0), 0);
++};
++
++const eventText = (event) => [event?.title, event?.description, ...(event?.tags || [])].join(" ");
++
++const categoryScores = (event) => {
++  const text = eventText(event);
++  return Object.fromEntries(Object.entries(KEYWORDS).map(([key, words]) => [key, countKeywordHits(text, words)]));
++};
++
++const categoryOf = (event) => {
++  const scores = categoryScores(event);
++  return Object.entries(scores).sort((a, b) => b[1] - a[1])[0]?.[1] > 0
++    ? Object.entries(scores).sort((a, b) => b[1] - a[1])[0][0]
++    : "general";
++};
++
++const isPlayableCandidate = (event) => {
++  if (!event || typeof event !== "object") return false;
++  if (!clean(event.id) || !clean(event.title) || !clean(event.description)) return false;
++  if (event.playerRelated !== true) return false;
++  if (["fallback", "espionage", "interactive"].includes(lower(event.source)) || lower(event.kind) === "interactive") return false;
++  return Boolean(IMPORTANCE[lower(event.importance)]) || event.notable === true;
++};
++
++const historyIds = (world) => {
++  const head = array(world?.simulationHistory)[0];
++  return new Set(array(head?.eventIds).map(clean).filter(Boolean));
++};
++
++const pickRecentEvents = ({ world, events }) => {
++  const ids = historyIds(world);
++  const current = array(events).filter((event) => ids.has(clean(event?.id)));
++  if (current.length) return current;
++  return array(events).slice(-18);
++};
++
++const activeAgreementPressure = (agreements) => array(agreements).filter((a) => ["active", "suspended"].includes(lower(a?.status))).length;
++const activeWarPressure = (wars) => array(wars).filter((w) => lower(w?.status) === "active").length;
++const activeProjectsPressure = (projects) => array(projects).filter((p) => ["active", "delayed", "stalled"].includes(lower(p?.status))).length;
++
++const average = (values, fallback = 50) => {
++  const nums = values.map(Number).filter(Number.isFinite);
++  return nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : fallback;
++};
++
++const topCountryNames = (world, playerName = "") => {
++  const seen = new Map();
++  const add = (name, weight = 1) => {
++    const n = clean(name);
++    if (!n) return;
++    seen.set(n, (seen.get(n) || 0) + weight);
++  };
++  add(playerName, 8);
++  for (const r of array(world?.relations)) {
++    add(r?.a, 2);
++    add(r?.b, 2);
++  }
++  for (const a of array(world?.agreements)) for (const p of array(a?.parties)) add(p, 1.5);
++  for (const w of array(world?.wars)) for (const p of [...array(w?.sideA), ...array(w?.sideB)]) add(p, 3);
++  return [...seen.entries()].sort((a, b) => b[1] - a[1]).slice(0, 24).map(([name]) => name);
++};
++
++export const buildInteractiveDeck = ({ world, events, round }) => {
++  const recent = pickRecentEvents({ world, events });
++  const played = new Set(array(world?.ohx?.playedMomentIds).map(clean));
++  const candidates = recent.filter((event) => isPlayableCandidate(event) && !played.has(clean(event.id)));
++  const scored = candidates.map((event, index) => {
++    const importance = IMPORTANCE[lower(event.importance)] || (event.notable ? 2 : 0);
++    const scores = categoryScores(event);
++    const breadth = Object.values(scores).filter((v) => v > 0).length;
++    const consequences = array(event?.impacts ? Object.keys(event.impacts) : []).length;
++    const recency = index / Math.max(1, candidates.length - 1);
++    const score = importance * 20 + (event.notable ? 12 : 0) + breadth * 5 + consequences * 3 + recency * 4;
++    const category = categoryOf(event);
++    const reasons = {
++      market: "Marchés et flux",
++      health: "Santé et capacité civile",
++      logistics: "Logistique et chaînes d'approvisionnement",
++      diplomacy: "Diplomatie et négociation",
++      security: "Sécurité et renseignement",
++      society: "Pression sociopolitique",
++      technology: "Technologie et information",
++      general: "Moment stratégique",
++    };
++    return {
++      eventId: clean(event.id),
++      title: clean(event.title),
++      date: clean(event.date),
++      category,
++      score,
++      reason: reasons[category] || reasons.general,
++    };
++  });
++  scored.sort((a, b) => b.score - a.score);
++  return {
++    round: finite(round, 1),
++    offers: scored.slice(0, 5),
++  };
++};
++
++export const deriveDynamics = ({ world, events }) => {
++  const recent = pickRecentEvents({ world, events });
++  const categoryTotals = Object.fromEntries(Object.keys(KEYWORDS).map((key) => [key, 0]));
++  let eventPressure = 0;
++  for (const event of recent) {
++    const weight = IMPORTANCE[lower(event?.importance)] || (event?.notable ? 2 : 1);
++    eventPressure += weight;
++    const scores = categoryScores(event);
++    for (const [key, hits] of Object.entries(scores)) categoryTotals[key] += hits * weight;
++  }
++
++  const storylinePressure = average(array(world?.storylines).filter((s) => lower(s?.status) === "active").map((s) => finite(s?.pressure)), 35);
++  const storylineMomentum = average(array(world?.storylines).filter((s) => lower(s?.status) === "active").map((s) => finite(s?.momentum)), 30);
++  const diplomacyHeat = clamp(activeWarPressure(world?.wars) * 10 + array(world?.relations).filter((r) => ["hostile", "rival", "strained"].includes(lower(r?.status))).length * 2 + activeAgreementPressure(world?.agreements));
++  const projectLoad = clamp(activeProjectsPressure(world?.projects) * 3);
++  const reportLoad = clamp(array(world?.reports).length * 0.6);
++  const spyLoad = clamp(array(world?.spies).filter((s) => lower(s?.status) === "active").length * 4);
++
++  const marketStress = clamp(30 + categoryTotals.market * 5 + categoryTotals.logistics * 2.5 + projectLoad * 0.8);
++  const healthPressure = clamp(20 + categoryTotals.health * 6 + categoryTotals.logistics * 1.2 + eventPressure * 0.3);
++  const logisticsStrain = clamp(20 + categoryTotals.logistics * 7 + projectLoad + categoryTotals.market * 1.5);
++  const informationNoise = clamp(15 + categoryTotals.technology * 6 + reportLoad + spyLoad + recent.length * 1.2);
++  const diplomaticHeatFinal = clamp(15 + diplomacyHeat + categoryTotals.diplomacy * 4);
++  const systemicRisk = clamp(0.28 * storylinePressure + 0.22 * storylineMomentum + 0.2 * marketStress + 0.14 * healthPressure + 0.16 * diplomaticHeatFinal);
++  const resilience = clamp(100 - (0.36 * logisticsStrain + 0.24 * marketStress + 0.18 * healthPressure + 0.12 * systemicRisk));
++  const reputationAverage = average(Object.values(world?.internationalReputation || {}).map(Number), 55);
++
++  return {
++    marketStress: Math.round(marketStress),
++    healthPressure: Math.round(healthPressure),
++    logisticsStrain: Math.round(logisticsStrain),
++    informationNoise: Math.round(informationNoise),
++    diplomaticHeat: Math.round(diplomaticHeatFinal),
++    systemicRisk: Math.round(systemicRisk),
++    resilience: Math.round(resilience),
++    institutionalTrust: Math.round(clamp(reputationAverage)),
++    pressure: Math.round(clamp(eventPressure * 4 + systemicRisk * 0.4)),
++    categories: Object.fromEntries(Object.entries(categoryTotals).map(([k, v]) => [k, Math.round(v)])),
++  };
++};
++
++export const deriveCrises = ({ world, events, dynamics }) => {
++  const recent = pickRecentEvents({ world, events });
++  const candidates = recent.filter((event) => Boolean(IMPORTANCE[lower(event?.importance)]) || event?.notable === true);
++  return candidates.slice().sort((a, b) => {
++    const wa = (IMPORTANCE[lower(a?.importance)] || 2) + (a?.notable ? 1 : 0);
++    const wb = (IMPORTANCE[lower(b?.importance)] || 2) + (b?.notable ? 1 : 0);
++    return wb - wa;
++  }).slice(0, 8).map((event) => {
++    const category = categoryOf(event);
++    const severity = clamp((IMPORTANCE[lower(event?.importance)] || 2) * 18 + (event?.notable ? 14 : 0) + dynamics.systemicRisk * 0.22 + dynamics.pressure * 0.15);
++    return {
++      id: `crisis-${clean(event.id)}`,
++      eventId: clean(event.id),
++      title: clean(event.title),
++      category,
++      severity: Math.round(severity),
++      status: severity >= 72 ? "critical" : severity >= 52 ? "active" : "watch",
++      date: clean(event.date),
++      description: clean(event.description).slice(0, 320),
++    };
++  });
++};
++
++export const deriveActors = ({ world, dynamics, playerName = "" }) => {
++  const names = topCountryNames(world, playerName);
++  return names.map((name) => {
++    const relations = array(world?.relations).filter((r) => lower(r?.a) === lower(name) || lower(r?.b) === lower(name));
++    const reputation = finite((world?.internationalReputation || {})[name], 50);
++    const hostile = relations.filter((r) => ["hostile", "rival", "strained"].includes(lower(r?.status))).length;
++    const friendly = relations.filter((r) => ["friendly", "cordial"].includes(lower(r?.status))).length;
++    const influence = clamp(45 + Math.abs(average(relations.map((r) => finite(r?.score)), 0)) * 0.22 + reputation * 0.25 + friendly * 4 - hostile * 5);
++    const pressure = clamp(25 + dynamics.diplomaticHeat * 0.45 + hostile * 10 + Math.max(0, 55 - reputation) * 0.4);
++    return { name, influence: Math.round(influence), pressure: Math.round(pressure), reputation: Math.round(clamp(reputation)), hostile, friendly };
++  }).sort((a, b) => b.influence - a.influence).slice(0, 12);
++};
++
++
++export const deriveStorylines = ({ world }) => array(world?.storylines)
++  .filter((s) => ["active", "dormant"].includes(lower(s?.status)))
++  .slice()
++  .sort((a, b) => (finite(b?.pressure) + finite(b?.momentum) * 0.7) - (finite(a?.pressure) + finite(a?.momentum) * 0.7))
++  .slice(0, 18)
++  .map((s) => ({
++    id: clean(s?.id),
++    title: clean(s?.title) || "Persistent thread",
++    kind: clean(s?.kind) || "world",
++    status: lower(s?.status) || "active",
++    pressure: Math.round(clamp(s?.pressure)),
++    momentum: Math.round(clamp(s?.momentum)),
++    nextReviewDate: clean(s?.nextReviewDate),
++    state: clean(s?.state).slice(0, 300),
++    participants: array(s?.participants).map(clean).filter(Boolean).slice(0, 6),
++  }));
++
++export const deriveCommitments = ({ world }) => array(world?.agreements)
++  .filter((a) => ["active", "suspended"].includes(lower(a?.status)))
++  .slice()
++  .sort((a, b) => String(a?.status).localeCompare(String(b?.status)) || String(a?.title).localeCompare(String(b?.title)))
++  .slice(0, 18)
++  .map((a) => ({
++    id: clean(a?.id),
++    title: clean(a?.title) || "Unnamed agreement",
++    type: clean(a?.type) || "other",
++    status: lower(a?.status) || "active",
++    parties: array(a?.parties).map(clean).filter(Boolean).slice(0, 6),
++    terms: clean(a?.terms).slice(0, 280),
++  }));
++
++export const buildExpansionState = ({ world, events, game }) => {
++  const round = finite(game?.round, 1);
++  const dynamics = deriveDynamics({ world, events });
++  const crises = deriveCrises({ world, events, dynamics });
++  const actors = deriveActors({ world, dynamics, playerName: game?.country || "" });
++  const commitments = deriveCommitments({ world });
++  const storylines = deriveStorylines({ world });
++  const old = world?.ohx && typeof world.ohx === "object" ? world.ohx : {};
++  const deck = buildInteractiveDeck({ world, events, round });
++  const playedMomentIds = array(old.playedMomentIds).map(clean).filter(Boolean).slice(-280);
++  const metricsHistory = [...array(old.metricsHistory), { round, date: clean(game?.gameDate), ...dynamics }].slice(-24);
++  return {
++    version: 1,
++    round,
++    gameDate: clean(game?.gameDate),
++    metrics: dynamics,
++    crises,
++    actors,
++    commitments,
++    storylines,
++    interactiveDeck: deck,
++    playedMomentIds,
++    metricsHistory,
++    lastUpdatedAt: new Date().toISOString(),
++  };
++};
+diff --git a/src/runtime/ohxExpansionUI.js b/src/runtime/ohxExpansionUI.js
+new file mode 100644
+index 0000000..16cd403
+--- /dev/null
++++ b/src/runtime/ohxExpansionUI.js
+@@ -0,0 +1,170 @@
++/*! Open Historia Expansion Layer — Situation Room UI, 2026. */
++
++const esc = (value) => String(value ?? "");
++const clamp = (value) => Math.max(0, Math.min(100, Number(value) || 0));
++
++const css = `
++:host{all:initial;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#f4f4f5}
++*{box-sizing:border-box}
++button{font:inherit}
++#ohx-root{position:fixed;right:16px;bottom:18px;z-index:2147483000}
++#ohx-launch{width:46px;height:46px;border-radius:50%;border:1px solid rgba(255,255,255,.22);background:rgba(18,18,22,.92);color:#fff;box-shadow:0 8px 28px rgba(0,0,0,.38);backdrop-filter:blur(14px);cursor:pointer;font-weight:800;letter-spacing:.02em}
++#ohx-panel{position:absolute;right:0;bottom:58px;width:min(390px,calc(100vw - 24px));max-height:min(72vh,640px);display:none;overflow:hidden;border:1px solid rgba(255,255,255,.14);border-radius:18px;background:linear-gradient(180deg,rgba(21,22,28,.97),rgba(12,13,17,.97));box-shadow:0 20px 60px rgba(0,0,0,.55);backdrop-filter:blur(18px)}
++#ohx-panel.open{display:flex;flex-direction:column}
++#ohx-head{display:flex;align-items:center;justify-content:space-between;padding:13px 14px 10px;border-bottom:1px solid rgba(255,255,255,.08)}
++#ohx-title{font-size:14px;font-weight:850;letter-spacing:.02em}.ohx-sub{font-size:10px;color:rgba(255,255,255,.5);margin-top:2px}
++#ohx-tabs{display:flex;gap:5px;padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.07);overflow:auto}
++.ohx-tab{border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.03);color:rgba(255,255,255,.68);border-radius:10px;padding:7px 9px;font-size:10px;cursor:pointer;white-space:nowrap}.ohx-tab.active{background:rgba(96,165,250,.18);border-color:rgba(96,165,250,.4);color:#dbeafe}
++#ohx-body{overflow:auto;padding:12px}.ohx-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.ohx-card{border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.025);border-radius:12px;padding:10px}.ohx-k{font-size:9px;color:rgba(255,255,255,.48);text-transform:uppercase;letter-spacing:.06em}.ohx-v{font-size:18px;font-weight:850;margin-top:2px}.ohx-p{height:5px;border-radius:5px;background:rgba(255,255,255,.08);overflow:hidden;margin-top:6px}.ohx-p>i{display:block;height:100%;background:linear-gradient(90deg,#60a5fa,#f59e0b,#ef4444);border-radius:inherit}
++.ohx-section{font-size:10px;font-weight:850;letter-spacing:.05em;text-transform:uppercase;color:rgba(255,255,255,.5);margin:14px 0 7px}.ohx-list{display:flex;flex-direction:column;gap:7px}.ohx-row{border:1px solid rgba(255,255,255,.07);background:rgba(255,255,255,.025);border-radius:12px;padding:9px}.ohx-rowtop{display:flex;gap:8px;align-items:flex-start;justify-content:space-between}.ohx-name{font-size:12px;font-weight:750}.ohx-meta{font-size:9px;color:rgba(255,255,255,.45);margin-top:2px}.ohx-desc{font-size:10px;line-height:1.45;color:rgba(255,255,255,.68);margin-top:6px}.ohx-pill{font-size:8px;font-weight:750;border-radius:999px;padding:3px 6px;background:rgba(255,255,255,.08);color:rgba(255,255,255,.72)}
++.ohx-play{border:1px solid rgba(250,204,21,.4);background:rgba(250,204,21,.12);color:#fef3c7;border-radius:8px;padding:6px 8px;font-size:9px;font-weight:800;cursor:pointer}.ohx-play:disabled{opacity:.45;cursor:default}
++.ohx-empty{font-size:10px;line-height:1.5;color:rgba(255,255,255,.45);padding:12px 2px}
++@media (max-width:520px){#ohx-root{right:10px;bottom:12px}#ohx-panel{width:calc(100vw - 20px);max-height:74vh}.ohx-grid{grid-template-columns:1fr 1fr}}
++`;
++
++const el = (tag, props = {}, children = []) => {
++  const node = document.createElement(tag);
++  for (const [key, value] of Object.entries(props)) {
++    if (key === "text") node.textContent = value;
++    else if (key === "className") node.className = value;
++    else if (key === "onClick") node.addEventListener("click", value);
++    else node.setAttribute(key, value);
++  }
++  for (const child of children) node.append(child);
++  return node;
++};
++
++const meter = (value) => {
++  const wrap = el("div", { className: "ohx-p" });
++  wrap.append(el("i", { style: `width:${clamp(value)}%` }));
++  return wrap;
++};
++
++export class OHXSituationRoom {
++  constructor({ getState, onPlayMoment }) {
++    this.getState = getState;
++    this.onPlayMoment = onPlayMoment;
++    this.tab = "overview";
++    this.host = document.createElement("div");
++    this.shadow = this.host.attachShadow({ mode: "open" });
++    const style = document.createElement("style");
++    style.textContent = css;
++    this.shadow.append(style);
++    this.root = el("div", { id: "ohx-root" });
++    this.launch = el("button", { id: "ohx-launch", title: "Open Historia Situation Room", text: "◎", onClick: () => this.toggle() });
++    this.panel = el("section", { id: "ohx-panel" });
++    this.root.append(this.panel, this.launch);
++    this.shadow.append(this.root);
++    document.body.append(this.host);
++    this.render();
++  }
++
++  toggle() {
++    this.panel.classList.toggle("open");
++    if (this.panel.classList.contains("open")) this.render();
++  }
++
++  setState() { if (this.panel.classList.contains("open")) this.render(); }
++
++  header(state) {
++    const h = el("div", { id: "ohx-head" });
++    const left = el("div", {}, [el("div", { id: "ohx-title", text: "SITUATION ROOM" }), el("div", { className: "ohx-sub", text: `${esc(state?.gameDate || "—")} · tour ${esc(state?.round || "—")}` })]);
++    const close = el("button", { className: "ohx-tab", text: "Fermer", onClick: () => this.panel.classList.remove("open") });
++    h.append(left, close); return h;
++  }
++
++  tabs() {
++    const wrap = el("div", { id: "ohx-tabs" });
++    for (const [id, label] of [["overview","Vue mondiale"],["moments","Moments"],["crises","Crises"],["threads","Fils actifs"],["actors","Acteurs"]]) {
++      wrap.append(el("button", { className: `ohx-tab${this.tab===id?" active":""}`, text: label, onClick: () => { this.tab=id; this.render(); } }));
++    }
++    return wrap;
++  }
++
++  overview(state) {
++    const m = state.metrics || {};
++    const body = el("div");
++    const grid = el("div", { className: "ohx-grid" });
++    const metrics = [["Risque systémique",m.systemicRisk],["Tension diplomatique",m.diplomaticHeat],["Stress des marchés",m.marketStress],["Pression sanitaire",m.healthPressure],["Logistique",m.logisticsStrain],["Bruit informationnel",m.informationNoise],["Confiance institutionnelle",m.institutionalTrust],["Résilience",m.resilience]];
++    for (const [label, value] of metrics) {
++      const card=el("div",{className:"ohx-card"},[el("div",{className:"ohx-k",text:label}),el("div",{className:"ohx-v",text:`${Math.round(value||0)}/100`}),meter(value)]);
++      grid.append(card);
++    }
++    body.append(grid);
++    const crises = arraySafe(state.crises).slice(0,3);
++    body.append(el("div",{className:"ohx-section",text:"Signaux dominants"}));
++    const list=el("div",{className:"ohx-list"});
++    for(const c of crises) list.append(el("div",{className:"ohx-row"},[el("div",{className:"ohx-rowtop"},[el("div",{className:"ohx-name",text:c.title}),el("span",{className:"ohx-pill",text:`${c.status} · ${c.severity}`})]),el("div",{className:"ohx-meta",text:`${c.date||""} · ${c.category}`})]));
++    if(!crises.length) list.append(el("div",{className:"ohx-empty",text:"Aucun signal saillant sur le dernier saut."}));
++    body.append(list);
++    return body;
++  }
++
++  moments(state) {
++    const body=el("div");
++    body.append(el("div",{className:"ohx-section",text:"Moments jouables supplémentaires"}));
++    body.append(el("div",{className:"ohx-empty",text:"Ces scènes utilisent les événements déjà générés par le moteur. Jouer une scène déclenche une seule requête IA supplémentaire et son résultat rejoint l'historique normal."}));
++    const list=el("div",{className:"ohx-list"});
++    const offers=arraySafe(state?.interactiveDeck?.offers);
++    for(const offer of offers){
++      const button=el("button",{className:"ohx-play",text:"Jouer",onClick:async()=>{button.disabled=true;try{await this.onPlayMoment(offer.eventId)}finally{button.disabled=false}}});
++      list.append(el("div",{className:"ohx-row"},[
++        el("div",{className:"ohx-rowtop"},[el("div",{},[el("div",{className:"ohx-name",text:offer.title}),el("div",{className:"ohx-meta",text:`${offer.date||""} · ${offer.reason}`})]),button]),
++      ]));
++    }
++    if(!offers.length) list.append(el("div",{className:"ohx-empty",text:"Aucun moment éligible n'est disponible sur le dernier saut. Le deck se renouvelle automatiquement au prochain événement."}));
++    body.append(list); return body;
++  }
++
++  crises(state){
++    const body=el("div"); const list=el("div",{className:"ohx-list"});
++    for(const c of arraySafe(state.crises)) list.append(el("div",{className:"ohx-row"},[
++      el("div",{className:"ohx-rowtop"},[el("div",{className:"ohx-name",text:c.title}),el("span",{className:"ohx-pill",text:`${c.status} · ${c.severity}/100`})]),
++      el("div",{className:"ohx-meta",text:`${c.date||""} · ${c.category}`}),
++      el("div",{className:"ohx-desc",text:c.description})
++    ]));
++    if(!arraySafe(state.crises).length) list.append(el("div",{className:"ohx-empty",text:"Le radar ne détecte actuellement aucune crise dominante."}));
++    body.append(el("div",{className:"ohx-section",text:"Radar de crise"}),list); return body;
++  }
++
++  threads(state){
++    const body=el("div"); const list=el("div",{className:"ohx-list"});
++    for(const t of arraySafe(state.storylines)) list.append(el("div",{className:"ohx-row"},[
++      el("div",{className:"ohx-rowtop"},[el("div",{className:"ohx-name",text:t.title}),el("span",{className:"ohx-pill",text:`${t.status} · ${t.pressure}`})]),
++      el("div",{className:"ohx-meta",text:`${t.kind} · pression ${t.pressure}/100 · momentum ${t.momentum}/100${t.nextReviewDate?` · revue ${t.nextReviewDate}`:""}`}),
++      t.participants.length ? el("div",{className:"ohx-desc",text:`Acteurs : ${t.participants.join(" · ")}`}) : null,
++      t.state ? el("div",{className:"ohx-desc",text:t.state}) : null,
++    ].filter(Boolean)));
++    if(!arraySafe(state.storylines).length) list.append(el("div",{className:"ohx-empty",text:"Aucun fil persistant n'est actuellement actif."}));
++    body.append(el("div",{className:"ohx-section",text:"Storylines persistantes"}),list); return body;
++  }
++
++  actors(state){
++    const body=el("div"); const list=el("div",{className:"ohx-list"});
++    for(const a of arraySafe(state.actors)) list.append(el("div",{className:"ohx-row"},[
++      el("div",{className:"ohx-rowtop"},[el("div",{className:"ohx-name",text:a.name}),el("span",{className:"ohx-pill",text:`influence ${a.influence}`})]),
++      el("div",{className:"ohx-meta",text:`réputation ${a.reputation} · pression ${a.pressure} · ${a.friendly} relations cordiales · ${a.hostile} tensions`}),
++    ]));
++    body.append(el("div",{className:"ohx-section",text:"Réseau d'acteurs"}),list);
++    const commitments=state.commitments||[];
++    body.append(el("div",{className:"ohx-section",text:"Engagements persistants"}));
++    const cl=el("div",{className:"ohx-list"});
++    for(const c of commitments.slice(0,8)) cl.append(el("div",{className:"ohx-row"},[
++      el("div",{className:"ohx-name",text:c.title}),
++      el("div",{className:"ohx-meta",text:`${c.status} · ${c.type} · ${c.parties.join(" · ")}`}),
++      c.terms ? el("div",{className:"ohx-desc",text:c.terms}) : null,
++    ].filter(Boolean)));
++    if(!commitments.length) cl.append(el("div",{className:"ohx-empty",text:"Aucun accord persistant détecté."}));
++    body.append(cl); return body;
++  }
++
++  render(){
++    const state=this.getState()||{};
++    this.panel.replaceChildren(this.header(state),this.tabs());
++    const body=el("div",{id:"ohx-body"});
++    body.append(this.tab==="overview"?this.overview(state):this.tab==="moments"?this.moments(state):this.tab==="crises"?this.crises(state):this.tab==="threads"?this.threads(state):this.actors(state));
++    this.panel.append(body);
++  }
++}
++
++const arraySafe = (value) => Array.isArray(value) ? value : [];
