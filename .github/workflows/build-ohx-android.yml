@@ -11,6 +11,16 @@ on:
       - ".github/workflows/build-ohx-android.yml"
       - "package.json"
       - "package-lock.json"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "mobile/**"
+      - "scripts/ohx/**"
+      - ".github/workflows/build-ohx-android.yml"
+      - "package.json"
+      - "package-lock.json"
   workflow_dispatch:
     inputs:
       build_variant:
